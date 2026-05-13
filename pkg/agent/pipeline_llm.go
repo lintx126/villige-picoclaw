@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/constants"
+	runtimeevents "github.com/sipeed/picoclaw/pkg/events"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
@@ -114,7 +114,7 @@ func (p *Pipeline) CallLLM(
 	}
 
 	al.emitEvent(
-		EventKindLLMRequest,
+		runtimeevents.KindAgentLLMRequest,
 		ts.eventMeta("runTurn", "turn.llm.request"),
 		LLMRequestPayload{
 			Model:         exec.llmModel,
@@ -185,7 +185,14 @@ func (p *Pipeline) CallLLM(
 
 	// Retry loop
 	var err error
-	maxRetries := 2
+	maxRetries := p.Cfg.Agents.Defaults.MaxLLMRetries
+	if maxRetries <= 0 {
+		maxRetries = 2
+	}
+	backoffSecs := p.Cfg.Agents.Defaults.LLMRetryBackoffSecs
+	if backoffSecs <= 0 {
+		backoffSecs = 2
+	}
 	for retry := 0; retry <= maxRetries; retry++ {
 		exec.response, err = callLLM(exec.callMessages, exec.providerToolDefs)
 		if err == nil {
@@ -200,7 +207,7 @@ func (p *Pipeline) CallLLM(
 		// Retry without media if vision is unsupported
 		if hasMediaRefs(exec.callMessages) && isVisionUnsupportedError(err) && retry < maxRetries {
 			al.emitEvent(
-				EventKindLLMRetry,
+				runtimeevents.KindAgentLLMRetry,
 				ts.eventMeta("runTurn", "turn.llm.retry"),
 				LLMRetryPayload{
 					Attempt:    retry + 1,
@@ -233,6 +240,15 @@ func (p *Pipeline) CallLLM(
 			strings.Contains(errMsg, "timed out") ||
 			strings.Contains(errMsg, "timeout exceeded")
 
+		isNetworkError := !isTimeoutError && (strings.Contains(errMsg, "connection reset") ||
+			strings.Contains(errMsg, "connection refused") ||
+			strings.Contains(errMsg, "broken pipe") ||
+			strings.Contains(errMsg, "no such host") ||
+			strings.Contains(errMsg, "network is unreachable") ||
+			strings.Contains(errMsg, "read tcp") ||
+			strings.Contains(errMsg, "write tcp") ||
+			strings.Contains(errMsg, "eof"))
+
 		isContextError := !isTimeoutError && (strings.Contains(errMsg, "context_length_exceeded") ||
 			strings.Contains(errMsg, "context window") ||
 			strings.Contains(errMsg, "context_window") ||
@@ -245,9 +261,9 @@ func (p *Pipeline) CallLLM(
 			strings.Contains(errMsg, "request too large"))
 
 		if isTimeoutError && retry < maxRetries {
-			backoff := time.Duration(retry+1) * 5 * time.Second
+			backoff := time.Duration(retry+1) * time.Duration(backoffSecs) * time.Second
 			al.emitEvent(
-				EventKindLLMRetry,
+				runtimeevents.KindAgentLLMRetry,
 				ts.eventMeta("runTurn", "turn.llm.retry"),
 				LLMRetryPayload{
 					Attempt:    retry + 1,
@@ -273,9 +289,38 @@ func (p *Pipeline) CallLLM(
 			continue
 		}
 
+		if isNetworkError && retry < maxRetries {
+			backoff := time.Duration(retry+1) * time.Duration(backoffSecs) * time.Second
+			al.emitEvent(
+				runtimeevents.KindAgentLLMRetry,
+				ts.eventMeta("runTurn", "turn.llm.retry"),
+				LLMRetryPayload{
+					Attempt:    retry + 1,
+					MaxRetries: maxRetries,
+					Reason:     "network",
+					Error:      err.Error(),
+					Backoff:    backoff,
+				},
+			)
+			logger.WarnCF("agent", "Network error, retrying after backoff", map[string]any{
+				"error":   err.Error(),
+				"retry":   retry,
+				"backoff": backoff.String(),
+			})
+			if sleepErr := sleepWithContext(turnCtx, backoff); sleepErr != nil {
+				if ts.hardAbortRequested() {
+					_ = ts.requestHardAbort()
+					return ControlBreak, nil
+				}
+				err = sleepErr
+				break
+			}
+			continue
+		}
+
 		if isContextError && retry < maxRetries && !ts.opts.NoHistory {
 			al.emitEvent(
-				EventKindLLMRetry,
+				runtimeevents.KindAgentLLMRetry,
 				ts.eventMeta("runTurn", "turn.llm.retry"),
 				LLMRetryPayload{
 					Attempt:    retry + 1,
@@ -319,11 +364,14 @@ func (p *Pipeline) CallLLM(
 				exec.history = asmResp.History
 				exec.summary = asmResp.Summary
 			}
-			exec.messages = ts.agent.ContextBuilder.BuildMessages(
-				exec.history, exec.summary, "",
-				nil, ts.channel, ts.chatID, ts.opts.Dispatch.SenderID(), ts.opts.SenderDisplayName,
-				activeSkillNames(ts.agent, ts.opts)...,
-			)
+			contextualSkills := ts.activeSkills
+			if ts.agent.ContextBuilder != nil {
+				contextualSkills = ts.agent.ContextBuilder.ResolveActiveSkillsForContext(ts.activeSkills)
+			}
+			ts.recordSkillContextSnapshot(skillContextTriggerContextRetryRebuild, contextualSkills)
+			rebuildPromptReq := promptBuildRequestForTurn(ts, exec.history, exec.summary, "", nil)
+			rebuildPromptReq.ActiveSkills = append([]string(nil), contextualSkills...)
+			exec.messages = ts.agent.ContextBuilder.BuildMessagesFromPrompt(rebuildPromptReq)
 			exec.callMessages = exec.messages
 			if exec.gracefulTerminal {
 				msgs := append([]providers.Message(nil), exec.messages...)
@@ -336,7 +384,7 @@ func (p *Pipeline) CallLLM(
 
 	if err != nil {
 		al.emitEvent(
-			EventKindError,
+			runtimeevents.KindAgentError,
 			ts.eventMeta("runTurn", "turn.error"),
 			ErrorPayload{
 				Stage:   "llm",
@@ -384,11 +432,12 @@ func (p *Pipeline) CallLLM(
 		}
 	}
 
-	reasoningContent := exec.response.Reasoning
-	if reasoningContent == "" {
-		reasoningContent = exec.response.ReasoningContent
-	}
-	if ts.channel == "pico" {
+	reasoningContent := responseReasoningContent(exec.response)
+	shouldPublishPicoToolCallInterim := ts.channel == "pico" && len(exec.response.ToolCalls) > 0
+	if shouldPublishPicoToolCallInterim {
+		// Pico tool-call turns publish their reasoning/content/tool summary as a
+		// structured sequence after the tool-call payload is normalized below.
+	} else if ts.channel == "pico" {
 		go al.publishPicoReasoning(turnCtx, reasoningContent, ts.chatID)
 	} else {
 		go al.handleReasoning(
@@ -399,7 +448,7 @@ func (p *Pipeline) CallLLM(
 		)
 	}
 	al.emitEvent(
-		EventKindLLMResponse,
+		runtimeevents.KindAgentLLMResponse,
 		ts.eventMeta("runTurn", "turn.llm.response"),
 		LLMResponsePayload{
 			ContentLen:   len(exec.response.Content),
@@ -423,30 +472,6 @@ func (p *Pipeline) CallLLM(
 		llmResponseFields["total_tokens"] = exec.response.Usage.TotalTokens
 	}
 	logger.DebugCF("agent", "LLM response", llmResponseFields)
-
-	if al.bus != nil &&
-		ts.channel == "pico" &&
-		len(exec.response.ToolCalls) > 0 &&
-		ts.opts.AllowInterimPicoPublish &&
-		!shouldPublishToolFeedback(al.cfg, ts) {
-		if strings.TrimSpace(exec.response.Content) != "" {
-			outCtx, outCancel := context.WithTimeout(turnCtx, 3*time.Second)
-			publishErr := al.bus.PublishOutbound(outCtx, bus.OutboundMessage{
-				Channel: ts.channel,
-				ChatID:  ts.chatID,
-				Content: exec.response.Content,
-			})
-			outCancel()
-			if publishErr != nil {
-				logger.WarnCF("agent", "Failed to publish pico interim tool-call content", map[string]any{
-					"error":     publishErr.Error(),
-					"channel":   ts.channel,
-					"chat_id":   ts.chatID,
-					"iteration": iteration,
-				})
-			}
-		}
-	}
 
 	// No-tool-call path: steering check and direct response
 	if len(exec.response.ToolCalls) == 0 || exec.gracefulTerminal {
@@ -496,7 +521,7 @@ func (p *Pipeline) CallLLM(
 	assistantMsg := providers.Message{
 		Role:             "assistant",
 		Content:          exec.response.Content,
-		ReasoningContent: exec.response.ReasoningContent,
+		ReasoningContent: reasoningContent,
 	}
 	for _, tc := range exec.normalizedToolCalls {
 		argumentsJSON, _ := json.Marshal(tc.Arguments)
@@ -504,7 +529,6 @@ func (p *Pipeline) CallLLM(
 			exec.response,
 			tc,
 			exec.messages,
-			al.cfg.Agents.Defaults.GetToolFeedbackMaxArgsLength(),
 		)
 		extraContent := tc.ExtraContent
 		if strings.TrimSpace(toolFeedbackExplanation) != "" {
@@ -535,6 +559,15 @@ func (p *Pipeline) CallLLM(
 		ts.agent.Sessions.AddFullMessage(ts.sessionKey, assistantMsg)
 		ts.recordPersistedMessage(assistantMsg)
 		ts.ingestMessage(turnCtx, al, assistantMsg)
+	}
+	if shouldPublishPicoToolCallInterim {
+		al.publishPicoToolCallInterim(
+			turnCtx,
+			ts,
+			reasoningContent,
+			exec.response.Content,
+			assistantMsg.ToolCalls,
+		)
 	}
 
 	return ControlToolLoop, nil

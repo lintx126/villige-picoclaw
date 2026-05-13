@@ -11,11 +11,23 @@
       "summarize_message_threshold": 20,
       "summarize_token_percent": 75,
       "split_on_marker": false,
+      "max_llm_retries": 2,
+      "llm_retry_backoff_secs": 2,
       "tool_feedback": {
         "enabled": false,
-        "max_args_length": 300
+        "max_args_length": 300,
+        "separate_messages": false
       }
     }
+  },
+  "evolution": {
+    "enabled": false,
+    "mode": "observe",
+    "state_dir": "",
+    "min_task_count": 2,
+    "min_success_ratio": 0.7,
+    "cold_path_trigger": "after_turn",
+    "cold_path_times": []
   },
   "model_list": [
     {
@@ -40,6 +52,7 @@
     },
     {
       "model_name": "gemini",
+      "_comment": "Optional: set \"tool_schema_transform\": \"simple\" for providers that reject complex tool JSON Schema.",
       "model": "antigravity/gemini-2.0-flash",
       "auth_method": "oauth"
     },
@@ -436,6 +449,9 @@
       "enabled": true,
       "mode": "bytes"
     },
+    "serial": {
+      "enabled": false
+    },
     "send_tts": {
       "enabled": false
     },
@@ -473,6 +489,15 @@
       "observer_timeout_ms": 500,
       "interceptor_timeout_ms": 5000,
       "approval_timeout_ms": 60000
+    }
+  },
+  "events": {
+    "logging": {
+      "enabled": true,
+      "include": ["agent.*"],
+      "exclude": [],
+      "min_severity": "info",
+      "include_payload": false
     }
   },
   "gateway": {
